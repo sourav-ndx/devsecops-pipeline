@@ -1,0 +1,258 @@
+# ==============================================================
+# GitHub Actions CI/CT Pipeline
+# Equivalent of the GitLab CI pipeline — same stages, same gates
+# Uses OIDC for zero-credential AWS auth (no static keys)
+# Self-hosted runner for air-gapped / private registry access
+# ==============================================================
+
+name: CI/CT Pipeline
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+    branches: [main]
+
+env:
+  IMAGE_NAME: quay.example.com/myorg/myapp
+  IMAGE_TAG: ${{ github.sha }}
+
+jobs:
+  # ============================================================
+  # LINT
+  # ============================================================
+  lint:
+    runs-on: self-hosted
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Lint pipeline YAML
+        run: yamllint .github/workflows/ci.yml
+
+      - name: Lint Dockerfile
+        uses: hadolint/hadolint-action@v3
+        with:
+          dockerfile: Dockerfile
+
+      - name: Lint Helm chart
+        run: helm lint ./helm/sample-chart
+
+      - name: Java checkstyle
+        run: mvn checkstyle:check --no-transfer-progress
+
+  # ============================================================
+  # BUILD
+  # ============================================================
+  build:
+    runs-on: self-hosted
+    needs: lint
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Maven build
+        run: mvn clean package -DskipTests --no-transfer-progress
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-artifacts-${{ github.sha }}
+          path: |
+            target/*.jar
+            target/classes/
+          retention-days: 1
+
+  # ============================================================
+  # UNIT TEST
+  # ============================================================
+  unit-test:
+    runs-on: self-hosted
+    needs: build
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: build-artifacts-${{ github.sha }}
+
+      - name: Run unit tests
+        run: mvn test --no-transfer-progress
+
+      - name: Check coverage threshold
+        run: |
+          COVERAGE=$(python3 -c "
+          import xml.etree.ElementTree as ET
+          tree = ET.parse('target/site/jacoco/jacoco.xml')
+          root = tree.getroot()
+          counters = {c.attrib['type']: c.attrib for c in root.findall('counter')}
+          missed = int(counters['LINE']['missed'])
+          covered = int(counters['LINE']['covered'])
+          pct = (covered / (missed + covered)) * 100
+          print(f'{pct:.1f}')
+          ")
+          echo "Coverage: $COVERAGE%"
+          if (( $(echo "$COVERAGE < 80" | bc -l) )); then
+            echo "FAIL: Coverage below 80%"
+            exit 1
+          fi
+
+      - name: Upload test results
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-results-${{ github.sha }}
+          path: |
+            target/site/jacoco/jacoco.xml
+            target/surefire-reports/
+          retention-days: 1
+
+      - name: Publish test report
+        uses: dorny/test-reporter@v1
+        if: always()
+        with:
+          name: JUnit Results
+          path: target/surefire-reports/TEST-*.xml
+          reporter: java-junit
+
+  # ============================================================
+  # SONARQUBE
+  # ============================================================
+  sonarqube:
+    runs-on: self-hosted
+    needs: unit-test
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0    # full history needed for SonarQube blame
+
+      - name: Download test artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: test-results-${{ github.sha }}
+
+      - name: SonarQube scan
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+          SONAR_HOST_URL: ${{ secrets.SONAR_HOST_URL }}
+        run: |
+          sonar-scanner \
+            -Dsonar.projectKey=my-platform-app \
+            -Dsonar.host.url=$SONAR_HOST_URL \
+            -Dsonar.login=$SONAR_TOKEN \
+            -Dsonar.java.binaries=target/classes \
+            -Dsonar.coverage.jacoco.xmlReportPaths=target/site/jacoco/jacoco.xml
+
+      - name: Check quality gate
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+          SONAR_HOST_URL: ${{ secrets.SONAR_HOST_URL }}
+        run: |
+          sleep 10
+          TASK_ID=$(cat .scannerwork/report-task.txt | grep ceTaskId | cut -d= -f2)
+          for i in {1..20}; do
+            STATUS=$(curl -s -u $SONAR_TOKEN: \
+              "$SONAR_HOST_URL/api/ce/task?id=$TASK_ID" \
+              | python3 -c "import sys,json; print(json.load(sys.stdin)['task']['status'])")
+            echo "Status: $STATUS"
+            [ "$STATUS" = "SUCCESS" ] && break
+            [ "$STATUS" = "FAILED" ] && exit 1
+            sleep 5
+          done
+          GATE=$(curl -s -u $SONAR_TOKEN: \
+            "$SONAR_HOST_URL/api/qualitygates/project_status?projectKey=my-platform-app" \
+            | python3 -c "import sys,json; print(json.load(sys.stdin)['projectStatus']['status'])")
+          echo "Quality Gate: $GATE"
+          [ "$GATE" = "OK" ] || exit 1
+
+  # ============================================================
+  # DOCKER BUILD + TRIVY SCAN + PUSH
+  # ============================================================
+  containerize-scan-push:
+    runs-on: self-hosted
+    needs: sonarqube
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: build-artifacts-${{ github.sha }}
+
+      - name: Build Docker image
+        run: |
+          docker build \
+            --build-arg APP_VERSION=${{ github.sha }} \
+            -t $IMAGE_NAME:${{ github.sha }} \
+            -t $IMAGE_NAME:latest \
+            .
+
+      - name: Trivy CVE scan — CRITICAL block
+        run: |
+          trivy image \
+            --server ${{ secrets.TRIVY_SERVER }} \
+            --exit-code 1 \
+            --severity CRITICAL \
+            --format table \
+            --output trivy-critical.txt \
+            $IMAGE_NAME:${{ github.sha }}
+
+      - name: Trivy CVE scan — HIGH report
+        run: |
+          trivy image \
+            --server ${{ secrets.TRIVY_SERVER }} \
+            --exit-code 0 \
+            --severity HIGH \
+            --format table \
+            --output trivy-high.txt \
+            $IMAGE_NAME:${{ github.sha }} || true
+
+      - name: Upload Trivy reports
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: trivy-reports-${{ github.sha }}
+          path: |
+            trivy-critical.txt
+            trivy-high.txt
+          retention-days: 7
+
+      - name: Push to registry
+        run: |
+          docker login quay.example.com -u ${{ secrets.QUAY_USER }} -p ${{ secrets.QUAY_PASSWORD }}
+          docker push $IMAGE_NAME:${{ github.sha }}
+          docker push $IMAGE_NAME:latest
+
+  # ============================================================
+  # DEPLOY DEV + INTEGRATION TEST
+  # ============================================================
+  deploy-dev:
+    runs-on: self-hosted
+    needs: containerize-scan-push
+    steps:
+      - name: Deploy to DEV
+        run: |
+          oc set image deployment/myapp myapp=$IMAGE_NAME:${{ github.sha }} -n app-dev
+          oc rollout status deployment/myapp -n app-dev --timeout=5m
+
+      - name: Integration tests
+        run: |
+          DEV_URL="https://myapp-dev.apps.cluster.example.com"
+          curl -f $DEV_URL/actuator/health
+          mvn verify -Pintegration-tests -Dapp.url=$DEV_URL --no-transfer-progress
+
+  # ============================================================
+  # DEPLOY LAB — manual, main branch only
+  # ============================================================
+  deploy-lab:
+    runs-on: self-hosted
+    needs: deploy-dev
+    if: github.ref == 'refs/heads/main'
+    environment:
+      name: lab                         # environment with required reviewers
+      url: https://myapp-lab.apps.cluster.example.com
+                                        # GitHub Environments protection rules
+                                        # enforce manual approval here
+    steps:
+      - name: Deploy to LAB
+        run: |
+          oc set image deployment/myapp myapp=$IMAGE_NAME:${{ github.sha }} -n app-lab
+          oc rollout status deployment/myapp -n app-lab --timeout=5m

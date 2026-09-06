@@ -1,0 +1,382 @@
+# ==============================================================
+# CI/CT Pipeline — Enterprise SIP Platform
+# Runner: Self-hosted shell executor on air-gapped bastion host
+# Model: CI/CT — continuous through lab, production via change mgmt
+# ==============================================================
+
+stages:
+  - lint
+  - build
+  - unit-test
+  - quality
+  - package
+  - containerize
+  - security-scan
+  - push
+  - deploy-dev
+  - integration-test
+  - deploy-lab
+
+# ==============================================================
+# GLOBAL VARIABLES
+# All secrets stored as Protected+Masked variables in GitLab UI
+# Never hardcoded in pipeline YAML
+# ==============================================================
+variables:
+  MAVEN_OPTS: "-Dmaven.repo.local=$CI_PROJECT_DIR/.m2/repository"
+  IMAGE_NAME: "quay.example.com/myorg/myapp"
+  IMAGE_TAG: "$CI_COMMIT_SHORT_SHA"
+  SONAR_PROJECT_KEY: "my-platform-app"
+  TRIVY_SERVER: "http://trivy-server.example.com:4954"
+  DEV_NAMESPACE: "app-dev"
+  LAB_NAMESPACE: "app-lab"
+
+# ==============================================================
+# CACHE — Maven dependency cache across pipeline runs
+# Saves download time on every run
+# ==============================================================
+cache:
+  paths:
+    - .m2/repository
+
+# ==============================================================
+# STAGE 1 — LINT
+# Fast fail before expensive build runs
+# Catches syntax errors, Dockerfile issues, Helm chart problems
+# Gate: Any error = exit non-zero = pipeline stops
+# ==============================================================
+lint:
+  stage: lint
+  script:
+    # Validate pipeline YAML structure
+    - yamllint .gitlab-ci.yml
+
+    # Dockerfile best practices (FROM pinned, no root, etc.)
+    - hadolint Dockerfile
+
+    # Helm chart structure and template syntax
+    - helm lint ./helm/sample-chart
+
+    # All YAML files in helm directory
+    - yamllint helm/
+
+    # Java code style (rules in checkstyle.xml in repo root)
+    - mvn checkstyle:check --no-transfer-progress
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "push"'
+
+# ==============================================================
+# STAGE 2 — BUILD
+# Maven compile — produces JAR artifact
+# Gate: Compile failure = pipeline stops
+# Output: target/*.jar and target/classes/ passed to downstream stages
+# ==============================================================
+build:
+  stage: build
+  script:
+    - echo "Building commit $CI_COMMIT_SHORT_SHA on branch $CI_COMMIT_BRANCH"
+    - mvn clean package -DskipTests --no-transfer-progress
+    - echo "Build complete — artifact target/*.jar ready"
+  artifacts:
+    name: "build-$CI_COMMIT_SHORT_SHA"
+    paths:
+      - target/*.jar            # consumed by: containerize stage (Dockerfile COPY)
+      - target/classes/         # consumed by: sonarqube stage (bytecode analysis)
+    expire_in: 1 hour
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "push"'
+
+# ==============================================================
+# STAGE 3 — UNIT TEST
+# JUnit test execution + JaCoCo coverage measurement
+# Gate 1: Any JUnit test failure = pipeline stops
+# Gate 2: Coverage below threshold = pipeline stops
+# Input: target/classes from build stage (via dependencies)
+# Output: jacoco.xml passed to SonarQube stage
+# ==============================================================
+unit-test:
+  stage: unit-test
+  script:
+    - echo "Running unit tests"
+    - mvn test --no-transfer-progress
+    # JaCoCo generates coverage report during mvn test
+    # Output: target/site/jacoco/jacoco.xml
+
+    # Secondary coverage gate in pipeline (SonarQube is primary)
+    # Belt-and-suspenders — catches coverage drop before SonarQube runs
+    - |
+      echo "Checking coverage threshold"
+      COVERAGE=$(python3 -c "
+      import xml.etree.ElementTree as ET
+      tree = ET.parse('target/site/jacoco/jacoco.xml')
+      root = tree.getroot()
+      counters = {c.attrib['type']: c.attrib for c in root.findall('counter')}
+      missed = int(counters['LINE']['missed'])
+      covered = int(counters['LINE']['covered'])
+      pct = (covered / (missed + covered)) * 100
+      print(f'{pct:.1f}')
+      ")
+      echo "Line coverage: $COVERAGE%"
+      if (( $(echo "$COVERAGE < 80" | bc -l) )); then
+        echo "FAIL: Coverage $COVERAGE% is below 80% pipeline minimum"
+        exit 1
+      fi
+      echo "Coverage gate PASSED: $COVERAGE%"
+  artifacts:
+    name: "test-results-$CI_COMMIT_SHORT_SHA"
+    paths:
+      - target/site/jacoco/jacoco.xml     # consumed by: sonarqube stage
+      - target/surefire-reports/          # consumed by: sonarqube stage + GitLab UI
+    reports:
+      junit: target/surefire-reports/TEST-*.xml   # GitLab parses this —
+                                                   # shows pass/fail counts in pipeline UI
+    expire_in: 1 hour
+  dependencies:
+    - build   # downloads target/classes from build stage
+
+# ==============================================================
+# STAGE 4 — SONARQUBE QUALITY GATE
+# Static analysis + coverage validation against server-defined gate
+# Gate: Quality gate fail = pipeline stops (API poll confirms result)
+# Input: source code + jacoco.xml from test stage
+# Quality Gate configured on SonarQube server:
+#   Coverage >= 90% | 0 Critical bugs | 0 Blocker issues
+#   0 unresolved Security Hotspots | Duplications < 3%
+# ==============================================================
+sonarqube:
+  stage: quality
+  script:
+    - echo "Running SonarQube analysis — commit $CI_COMMIT_SHORT_SHA"
+    - |
+      sonar-scanner \
+        -Dsonar.projectKey=$SONAR_PROJECT_KEY \
+        -Dsonar.host.url=$SONAR_HOST_URL \
+        -Dsonar.login=$SONAR_TOKEN \
+        -Dsonar.java.binaries=target/classes \
+        -Dsonar.coverage.jacoco.xmlReportPaths=target/site/jacoco/jacoco.xml \
+        -Dsonar.junit.reportPaths=target/surefire-reports \
+        -Dsonar.scm.revision=$CI_COMMIT_SHA
+
+    # Poll SonarQube API for quality gate result
+    # Analysis upload is async — server processes after scanner completes
+    - |
+      echo "Polling SonarQube for quality gate result..."
+      sleep 10
+
+      TASK_ID=$(cat .scannerwork/report-task.txt | grep ceTaskId | cut -d= -f2)
+      echo "Analysis task ID: $TASK_ID"
+
+      # Wait for analysis task to complete (max 100 seconds)
+      for i in {1..20}; do
+        STATUS=$(curl -s -u $SONAR_TOKEN: \
+          "$SONAR_HOST_URL/api/ce/task?id=$TASK_ID" \
+          | python3 -c "import sys,json; print(json.load(sys.stdin)['task']['status'])")
+
+        echo "Task status: $STATUS (attempt $i/20)"
+
+        if [ "$STATUS" = "SUCCESS" ]; then
+          break
+        elif [ "$STATUS" = "FAILED" ] || [ "$STATUS" = "CANCELLED" ]; then
+          echo "FAIL: SonarQube analysis task failed on server"
+          exit 1
+        fi
+        sleep 5
+      done
+
+      # Check quality gate result
+      GATE=$(curl -s -u $SONAR_TOKEN: \
+        "$SONAR_HOST_URL/api/qualitygates/project_status?projectKey=$SONAR_PROJECT_KEY" \
+        | python3 -c "import sys,json; print(json.load(sys.stdin)['projectStatus']['status'])")
+
+      echo "Quality Gate result: $GATE"
+
+      if [ "$GATE" != "OK" ]; then
+        echo "FAIL: SonarQube Quality Gate failed — pipeline blocked"
+        echo "Review at: $SONAR_HOST_URL/dashboard?id=$SONAR_PROJECT_KEY"
+        exit 1
+      fi
+      echo "Quality Gate PASSED — proceeding to package stage"
+  dependencies:
+    - unit-test   # downloads jacoco.xml and surefire-reports
+
+# ==============================================================
+# STAGE 5 — ARTIFACTORY PACKAGE
+# Store versioned JAR as a traceable release artifact
+# Gate: Upload failure = pipeline stops
+# Artifact versioned by commit SHA — full traceability
+# ==============================================================
+package:
+  stage: package
+  script:
+    - echo "Uploading versioned artifact to Artifactory"
+    - |
+      curl -f -u $ARTIFACTORY_USER:$ARTIFACTORY_PASSWORD \
+        -T target/myapp.jar \
+        "$ARTIFACTORY_URL/libs-release/myapp/$CI_COMMIT_SHORT_SHA/myapp-$CI_COMMIT_SHORT_SHA.jar"
+    - echo "Artifact stored: myapp-$CI_COMMIT_SHORT_SHA.jar"
+  dependencies:
+    - build
+
+# ==============================================================
+# STAGE 6 — DOCKER BUILD
+# Build container image using UBI8 base (minimal CVE surface)
+# Multi-stage build — only JRE + JAR in final image
+# Non-root user enforced in Dockerfile
+# Gate: Build failure = pipeline stops
+# Image stays in local Docker daemon — not pushed yet
+# ==============================================================
+containerize:
+  stage: containerize
+  script:
+    - echo "Building Docker image $IMAGE_NAME:$IMAGE_TAG"
+    - |
+      docker build \
+        --build-arg APP_VERSION=$CI_COMMIT_SHORT_SHA \
+        --build-arg BUILD_DATE=$(date -u +%Y-%m-%dT%H:%M:%SZ) \
+        -t $IMAGE_NAME:$IMAGE_TAG \
+        -t $IMAGE_NAME:latest \
+        .
+    - echo "Image built successfully — not yet pushed, Trivy scan next"
+  dependencies:
+    - build   # downloads target/*.jar for Dockerfile COPY instruction
+
+# ==============================================================
+# STAGE 7 — TRIVY CVE SCAN
+# Scan built image before it reaches the registry
+# Air-gapped mode: client connects to internal Trivy server
+# Internal server maintains offline-synced CVE database (daily refresh)
+# Gate: CRITICAL CVE = --exit-code 1 = job fails = image never pushed
+# HIGH: reported only, does not block (reviewed in separate process)
+# Report saved always — even on failure — for audit trail
+# ==============================================================
+trivy-scan:
+  stage: security-scan
+  script:
+    - echo "CVE scan — connecting to internal Trivy server: $TRIVY_SERVER"
+    - |
+      # Hard block on CRITICAL — image must not reach registry with critical CVEs
+      trivy image \
+        --server $TRIVY_SERVER \
+        --exit-code 1 \
+        --severity CRITICAL \
+        --format table \
+        --output trivy-report-critical.txt \
+        $IMAGE_NAME:$IMAGE_TAG
+
+    - echo "CRITICAL CVE check passed"
+
+    - |
+      # Report HIGH without blocking — saved for review
+      trivy image \
+        --server $TRIVY_SERVER \
+        --exit-code 0 \
+        --severity HIGH \
+        --format table \
+        --output trivy-report-high.txt \
+        $IMAGE_NAME:$IMAGE_TAG || true
+    
+    - echo "Trivy scan complete — image is clean of CRITICAL CVEs"
+  artifacts:
+    name: "trivy-reports-$CI_COMMIT_SHORT_SHA"
+    paths:
+      - trivy-report-critical.txt
+      - trivy-report-high.txt
+    when: always        # save report even when job fails — needed for audit
+    expire_in: 7 days
+
+# ==============================================================
+# STAGE 8 — PUSH TO QUAY
+# Image reaches registry only after all gates passed:
+# lint ✓ build ✓ test ✓ quality gate ✓ trivy ✓
+# Tagged with commit SHA for full traceability
+# Gate: Push failure = pipeline stops
+# ==============================================================
+push-image:
+  stage: push
+  script:
+    - echo "Authenticating to Quay"
+    - docker login quay.example.com -u $QUAY_USER -p $QUAY_PASSWORD
+    - echo "Pushing $IMAGE_NAME:$IMAGE_TAG"
+    - docker push $IMAGE_NAME:$IMAGE_TAG
+    - docker push $IMAGE_NAME:latest
+    - echo "Image pushed — SHA $CI_COMMIT_SHORT_SHA is now in registry"
+
+# ==============================================================
+# STAGE 9 — DEPLOY TO DEV (AUTOMATIC)
+# Rolling deploy to dev namespace — runs automatically
+# OCP readiness probes act as deployment gate:
+#   if pods fail readiness → rollout stalls → timeout → job fails
+# Gate: oc rollout status timeout = pipeline stops
+# ==============================================================
+deploy-dev:
+  stage: deploy-dev
+  script:
+    - echo "Deploying $IMAGE_TAG to DEV namespace $DEV_NAMESPACE"
+    - |
+      oc set image deployment/myapp \
+        myapp=$IMAGE_NAME:$IMAGE_TAG \
+        -n $DEV_NAMESPACE
+    - |
+      # Wait for rollout — readiness probes must pass within 5 minutes
+      # If pods fail health checks, rollout stalls, this command times out
+      oc rollout status deployment/myapp \
+        -n $DEV_NAMESPACE \
+        --timeout=5m
+    - echo "DEV deployment successful — $IMAGE_TAG live"
+  environment:
+    name: dev
+    url: https://myapp-dev.apps.cluster.example.com
+
+# ==============================================================
+# STAGE 10 — INTEGRATION TEST (against live DEV)
+# Tests run against the actually deployed dev environment
+# Confirms the application works end-to-end, not just unit level
+# Gate: Test failure = pipeline stops, lab deploy blocked
+# ==============================================================
+integration-test:
+  stage: integration-test
+  script:
+    - DEV_URL="https://myapp-dev.apps.cluster.example.com"
+    - echo "Running integration tests against $DEV_URL"
+
+    # Health check — confirm app is responding before test suite runs
+    - |
+      curl -f $DEV_URL/actuator/health || {
+        echo "FAIL: Application not healthy in DEV"
+        exit 1
+      }
+
+    # Full integration test suite (Newman/Postman, pytest, or mvn verify)
+    - mvn verify -Pintegration-tests -Dapp.url=$DEV_URL --no-transfer-progress
+
+    - echo "Integration tests passed"
+  dependencies: []      # no file artifacts needed — tests hit live URL
+
+# ==============================================================
+# STAGE 11 — DEPLOY TO LAB (MANUAL GATE)
+# Promotion to lab requires human approval in GitLab UI
+# Lab is where QA, feature testing, and stress testing happen
+# Only runs on main branch (merged PRs)
+# Production is NOT part of this pipeline — see architecture notes
+# ==============================================================
+deploy-lab:
+  stage: deploy-lab
+  script:
+    - echo "Deploying $IMAGE_TAG to LAB namespace $LAB_NAMESPACE"
+    - |
+      oc set image deployment/myapp \
+        myapp=$IMAGE_NAME:$IMAGE_TAG \
+        -n $LAB_NAMESPACE
+    - |
+      oc rollout status deployment/myapp \
+        -n $LAB_NAMESPACE \
+        --timeout=5m
+    - echo "LAB deployment successful — QA team can begin testing"
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "main"'
+      when: manual          # human must click play in GitLab UI
+    - when: never
+  allow_failure: false
+  environment:
+    name: lab
+    url: https://myapp-lab.apps.cluster.example.com

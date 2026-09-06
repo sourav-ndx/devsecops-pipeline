@@ -1,0 +1,64 @@
+# ArgoCD Application CR — IPSG Dev Environment
+# Applied once: oc apply -f manifests/ -n openshift-gitops
+# After this, ArgoCD manages itself and syncs automatically
+
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: ipsg-dev
+  namespace: openshift-gitops
+  labels:
+    app: ipsg
+    env: dev
+spec:
+  project: default
+
+  source:
+    repoURL: https://gitlab.example.com/platform/ipsg-manifests.git
+    targetRevision: main
+    path: helm/ipsg-chart
+    helm:
+      valueFiles:
+        - values-dev.yaml     # environment-specific overrides
+
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: ipsg-dev
+
+  syncPolicy:
+    automated:
+      prune: true             # delete resources removed from manifests
+      selfHeal: true          # revert manual cluster changes back to git state
+    syncOptions:
+      - CreateNamespace=true  # create namespace if it doesn't exist
+      - ServerSideApply=true
+
+---
+# ArgoCD Application CR — IPSG Lab Environment
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: ipsg-lab
+  namespace: openshift-gitops
+  labels:
+    app: ipsg
+    env: lab
+spec:
+  project: default
+
+  source:
+    repoURL: https://gitlab.example.com/platform/ipsg-manifests.git
+    targetRevision: main
+    path: helm/ipsg-chart
+    helm:
+      valueFiles:
+        - values-lab.yaml
+
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: ipsg-lab
+
+  syncPolicy:
+    automated: {}             # automated sync, no selfHeal for lab
+    syncOptions:
+      - CreateNamespace=true
