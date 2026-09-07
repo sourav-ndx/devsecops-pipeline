@@ -1,5 +1,5 @@
 # ==============================================================
-# CI/CT Pipeline — Enterprise SIP Platform
+# CI/CT Pipeline — Enterprise Platform
 # Runner: Self-hosted shell executor on air-gapped bastion host
 # Model: CI/CT — continuous through lab, production via change mgmt
 # ==============================================================

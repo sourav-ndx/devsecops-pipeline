@@ -1,0 +1,18 @@
+# Lab environment overrides
+# Higher resources for stress testing
+image:
+  tag: latest   # updated manually or via separate promotion pipeline
+
+replicaCount: 2
+
+config:
+  logLevel: INFO
+  environment: lab
+
+resources:
+  requests:
+    memory: "512Mi"
+    cpu: "200m"
+  limits:
+    memory: "1Gi"
+    cpu: "1000m"

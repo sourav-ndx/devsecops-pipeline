@@ -1,12 +1,12 @@
-# GitOps Variant — ArgoCD + Helm for IPSG
+# GitOps Variant — ArgoCD + Helm for myapp
 
-For the IPSG microservice, the standard pipeline's deploy stage is replaced with a manifests repo update. ArgoCD handles the actual deployment. This is the two-repo GitOps model.
+For the myapp microservice, the standard pipeline's deploy stage is replaced with a manifests repo update. ArgoCD handles the actual deployment. This is the two-repo GitOps model.
 
 ---
 
-## Why GitOps for IPSG?
+## Why GitOps for myapp?
 
-IPSG manages multiple interdependent Kubernetes resources — Deployment, ClusterIP Service, MetalLB LoadBalancer Service, Route, ConfigMap, Secret. Managing these as separate YAMLs across environments became error-prone. Packaging them into a Helm chart with environment-specific values files (`values-dev.yaml`, `values-lab.yaml`) and letting ArgoCD manage the sync gave us:
+myapp manages multiple interdependent Kubernetes resources — Deployment, ClusterIP Service, MetalLB LoadBalancer Service, Route, ConfigMap, Secret. Managing these as separate YAMLs across environments became error-prone. Packaging them into a Helm chart with environment-specific values files (`values-dev.yaml`, `values-lab.yaml`) and letting ArgoCD manage the sync gave us:
 
 - **One-command full-stack deployment** via Helm
 - **Git as the source of truth** — the cluster state is always derivable from the manifests repo
@@ -26,14 +26,14 @@ Repo 1: Application source repo
 
 Repo 2: Manifests repo (separate repo)
 ├── helm/
-│   └── ipsg-chart/
+│   └── myapp-chart/
 │       ├── Chart.yaml
 │       ├── values.yaml          ← base values
 │       ├── values-dev.yaml      ← dev overrides
 │       └── values-lab.yaml      ← lab overrides
 └── argocd-apps/
-    ├── ipsg-dev.yaml            ← ArgoCD Application CR for dev
-    └── ipsg-lab.yaml            ← ArgoCD Application CR for lab
+    ├── myapp-dev.yaml            ← ArgoCD Application CR for dev
+    └── myapp-lab.yaml            ← ArgoCD Application CR for lab
 ```
 
 **Why separate repos:**
@@ -49,24 +49,24 @@ Repo 2: Manifests repo (separate repo)
 Everything up to push-image is identical to the standard pipeline. Only the deploy stage changes:
 
 ```yaml
-# Replaces deploy-dev stage for IPSG
+# Replaces deploy-dev stage for myapp
 update-manifests:
   stage: deploy-dev
   script:
     - echo "Updating manifests repo — new image tag: $IMAGE_TAG"
 
     # Clone the separate manifests repo
-    - git clone https://gitlab.example.com/platform/ipsg-manifests.git
-    - cd ipsg-manifests
+    - git clone https://gitlab.example.com/platform/myapp-manifests.git
+    - cd myapp-manifests
 
     # Update only the image tag — one line change in values file
     # yq is a YAML command-line editor
-    - yq e '.image.tag = "'$IMAGE_TAG'"' -i helm/ipsg-chart/values-dev.yaml
+    - yq e '.image.tag = "'$IMAGE_TAG'"' -i helm/myapp-chart/values-dev.yaml
 
     # Commit and push
     - git config user.email "ci-bot@example.com"
     - git config user.name "GitLab CI"
-    - git add helm/ipsg-chart/values-dev.yaml
+    - git add helm/myapp-chart/values-dev.yaml
     - git commit -m "ci: update image tag to $IMAGE_TAG [skip ci]"
     - git push origin main
 
@@ -92,7 +92,7 @@ ArgoCD detects values-dev.yaml changed (image.tag is different)
      │
      ▼
 ArgoCD renders Helm chart with updated values
-helm template ipsg-chart -f values-dev.yaml
+helm template myapp-chart -f values-dev.yaml
      │
      ▼
 ArgoCD compares rendered manifests to current cluster state
@@ -117,24 +117,24 @@ ArgoCD shows: Synced + Healthy
 One Application CR per environment, all stored in manifests repo under `argocd-apps/`:
 
 ```yaml
-# argocd-apps/ipsg-dev.yaml
+# argocd-apps/myapp-dev.yaml
 apiVersion: argoproj.io/v1alpha1
 kind: Application
 metadata:
-  name: ipsg-dev
+  name: myapp-dev
   namespace: openshift-gitops
 spec:
   project: default
   source:
-    repoURL: https://gitlab.example.com/platform/ipsg-manifests.git
+    repoURL: https://gitlab.example.com/platform/myapp-manifests.git
     targetRevision: main
-    path: helm/ipsg-chart
+    path: helm/myapp-chart
     helm:
       valueFiles:
         - values-dev.yaml
   destination:
     server: https://kubernetes.default.svc
-    namespace: ipsg-dev
+    namespace: myapp-dev
   syncPolicy:
     automated:
       prune: true        # delete resources removed from manifests
@@ -144,24 +144,24 @@ spec:
 ```
 
 ```yaml
-# argocd-apps/ipsg-lab.yaml
+# argocd-apps/myapp-lab.yaml
 apiVersion: argoproj.io/v1alpha1
 kind: Application
 metadata:
-  name: ipsg-lab
+  name: myapp-lab
   namespace: openshift-gitops
 spec:
   project: default
   source:
-    repoURL: https://gitlab.example.com/platform/ipsg-manifests.git
+    repoURL: https://gitlab.example.com/platform/myapp-manifests.git
     targetRevision: main
-    path: helm/ipsg-chart
+    path: helm/myapp-chart
     helm:
       valueFiles:
         - values-lab.yaml
   destination:
     server: https://kubernetes.default.svc
-    namespace: ipsg-lab
+    namespace: myapp-lab
   syncPolicy:
     automated: {}        # no selfHeal for lab — manual sync only
 ```
@@ -179,7 +179,7 @@ After this, ArgoCD manages itself and the applications. Never need to touch it a
 **CI pipeline rollback:** If the latest deploy broke something in dev, find the previous good commit SHA from the manifests repo git log:
 
 ```bash
-git log --oneline helm/ipsg-chart/values-dev.yaml
+git log --oneline helm/myapp-chart/values-dev.yaml
 # abc1234 ci: update image tag to abc1234
 # def5678 ci: update image tag to def5678  ← previous good one
 

@@ -114,7 +114,7 @@ This command blocks until all pods in the new ReplicaSet are Ready, or until tim
 Production deployment is intentionally not part of this pipeline.
 
 **Why:**
-- Platform carries live SIP voice traffic for a carrier network
+- Platform carries real-time traffic for an enterprise platform
 - Automated deployment to production during business hours is unacceptable risk
 - Regulatory and operational requirements mandate change management
 - Deployment requires a formal change ticket, architecture/security review, approval, and a scheduled maintenance window

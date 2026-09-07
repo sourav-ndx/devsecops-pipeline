@@ -1,0 +1,18 @@
+# Dev environment overrides
+# image.tag updated by CI pipeline on every commit to main
+image:
+  tag: latest   # replaced by CI: yq e '.image.tag = "abc1234"' -i values-dev.yaml
+
+replicaCount: 1
+
+config:
+  logLevel: DEBUG
+  environment: dev
+
+resources:
+  requests:
+    memory: "256Mi"
+    cpu: "100m"
+  limits:
+    memory: "512Mi"
+    cpu: "500m"
